@@ -18,91 +18,94 @@ const INSTANCE_MAP = {
 var cache = {};
 var cwApi = axios.create({ baseURL: CHATWOOT_URL + '/api/v1/accounts/' + ACCOUNT_ID, headers: { 'api_access_token': CHATWOOT_API_TOKEN, 'Content-Type': 'application/json' }, timeout: 15000 });
 
-async function getOrCreateContact(num, name) {
-  if (cache['c:' + num]) return cache['c:' + num];
+async function getOrCreateContact(num, name, inboxId) {
+  var k = inboxId + ':' + num;
+  if (cache[k] && cache[k].contact_id) return cache[k].contact_id;
   try {
     var s = await cwApi.get('/contacts/search?q=' + num);
-    var p = s.data.payload || [];
-    if (p.length > 0) { cache['c:' + num] = p[0].id; return p[0].id; }
+    var c = s.data.payload || [];
+    if (c.length > 0) { cache[k] = cache[k] || {}; cache[k].contact_id = c[0].id; return c[0].id; }
   } catch(e) {}
   var r = await cwApi.post('/contacts', { name: name, phone_number: '+' + num, identifier: 'whatsapp:' + num });
   var id = r.data.payload.contact.id;
-  cache['c:' + num] = id;
+  cache[k] = cache[k] || {}; cache[k].contact_id = id;
   return id;
 }
 
 async function getOrCreateConv(contactId, inboxId, num) {
   var k = inboxId + ':' + num;
-  if (cache[k]) {
-    try { var c = await cwApi.get('/conversations/' + cache[k]); if (c.data.status === 'open' || c.data.status === 'pending') return cache[k]; } catch(e) {}
+  if (cache[k] && cache[k].conv_id) {
+    try { var cv = await cwApi.get('/conversations/' + cache[k].conv_id); if (cv.data.status === 'open' || cv.data.status === 'pending') return cache[k].conv_id; } catch(e) {}
   }
   try {
     var cs = await cwApi.get('/contacts/' + contactId + '/conversations');
     var convs = cs.data.payload || [];
     for (var i = 0; i < convs.length; i++) {
-      if (convs[i].inbox_id === inboxId && (convs[i].status === 'open' || convs[i].status === 'pending')) { cache[k] = convs[i].id; return convs[i].id; }
+      if (convs[i].inbox_id === inboxId && (convs[i].status === 'open' || convs[i].status === 'pending')) {
+        cache[k] = cache[k] || {}; cache[k].conv_id = convs[i].id; return convs[i].id;
+      }
     }
   } catch(e) {}
   var r = await cwApi.post('/conversations', { contact_id: contactId, inbox_id: inboxId, status: 'open' });
-  cache[k] = r.data.id;
+  cache[k] = cache[k] || {}; cache[k].conv_id = r.data.id;
   return r.data.id;
 }
 
 app.post('/webhook/:instance', async (req, res) => {
   var inst = req.params.instance, cfg = INSTANCE_MAP[inst], ts = new Date().toISOString();
-  if (!cfg) return res.status(200).json({s:'unknown'});
-  var body = req.body, event = body.event;
-  if (!event || (event !== 'messages.upsert' && event !== 'MESSAGES_UPSERT')) return res.status(200).json({s:'skip'});
+  if (!cfg) return res.status(200).json({ s: 'unknown' });
+  var body = req.body, ev = body.event;
+  console.log('[' + ts + '] [' + cfg.label + '] ev=' + ev);
+  if (!ev || (ev !== 'messages.upsert' && ev !== 'MESSAGES_UPSERT')) return res.status(200).json({ s: 'skip' });
   var data = body.data || body, key = data.key, msg = data.message;
-  if (!key || key.fromMe) return res.status(200).json({s:'skip'});
+  if (!key || key.fromMe) return res.status(200).json({ s: 'skip' });
   var jid = key.remoteJid || '';
-  if (jid.endsWith('@g.us') || jid === 'status@broadcast') return res.status(200).json({s:'skip'});
-  var num = jid.replace('@s.whatsapp.net',''), name = data.pushName || num;
+  if (jid.endsWith('@g.us') || jid === 'status@broadcast') return res.status(200).json({ s: 'skip' });
+  var num = jid.replace('@s.whatsapp.net', ''), name = data.pushName || num;
   var content = '';
   if (msg && msg.conversation) content = msg.conversation;
   else if (msg && msg.extendedTextMessage && msg.extendedTextMessage.text) content = msg.extendedTextMessage.text;
-  else if (msg && msg.imageMessage) content = '[Imagem]';
+  else if (msg && msg.imageMessage) content = msg.imageMessage.caption ? '[Img] ' + msg.imageMessage.caption : '[Imagem]';
   else if (msg && msg.videoMessage) content = '[Video]';
   else if (msg && msg.audioMessage) content = '[Audio]';
-  else if (msg && msg.documentMessage) content = '[Documento]';
+  else if (msg && msg.documentMessage) content = '[Doc]';
   else if (msg && msg.stickerMessage) content = '[Sticker]';
-  else if (msg && msg.locationMessage) content = '[Localizacao]';
-  else if (msg && msg.contactMessage) content = '[Contato]';
-  else if (msg && msg.protocolMessage) return res.status(200).json({s:'protocol'});
-  else content = '[Mensagem]';
-  console.log('['+ts+'] ['+cfg.label+'] '+name+' ('+num+'): '+content);
+  else if (msg && msg.protocolMessage) return res.status(200).json({ s: 'protocol' });
+  else content = '[Msg]';
+  console.log('[' + ts + '] [' + cfg.label + '] ' + name + ' (' + num + '): ' + content);
   try {
-    var cid = await getOrCreateContact(num, name);
+    var cid = await getOrCreateContact(num, name, cfg.inbox_id);
     var convId = await getOrCreateConv(cid, cfg.inbox_id, num);
     await cwApi.post('/conversations/' + convId + '/messages', { content: content, message_type: 'incoming', private: false });
-    console.log('['+ts+'] ['+cfg.label+'] OK conv='+convId);
+    console.log('[' + ts + '] [' + cfg.label + '] INCOMING conv=' + convId);
   } catch(err) {
-    console.error('['+ts+'] ['+cfg.label+'] ERR: '+(err.response ? JSON.stringify(err.response.data) : err.message));
+    console.error('[' + ts + '] [' + cfg.label + '] ERR: ' + (err.response ? JSON.stringify(err.response.data) : err.message));
   }
-  res.status(200).json({s:'ok'});
+  res.status(200).json({ s: 'ok' });
 });
 
 app.post('/chatwoot-webhook', async (req, res) => {
   var ts = new Date().toISOString();
-  if (req.body.event !== 'message_created') return res.status(200).json({s:'skip'});
+  if (req.body.event !== 'message_created') return res.status(200).json({ s: 'skip' });
   var m = req.body;
-  if (m.message_type !== 'outgoing' || !m.content || m.content_type === 'activity' || m.private) return res.status(200).json({s:'skip'});
-  var iid = m.conversation && m.conversation.inbox_id, ei = null, ec = null;
-  for (var i in INSTANCE_MAP) { if (INSTANCE_MAP[i].inbox_id === iid) { ei = i; ec = INSTANCE_MAP[i]; break; } }
-  if (!ei) return res.status(200).json({s:'no_map'});
-  var mt = (m.conversation && m.conversation.meta && m.conversation.meta.sender) || {};
-  var ph = (mt.phone_number||'').replace(/[^0-9]/g,'');
-  if (!ph) ph = (mt.identifier||'').replace('whatsapp:','').replace(/[^0-9]/g,'');
-  if (!ph && m.sender) ph = (m.sender.phone_number||'').replace(/[^0-9]/g,'');
-  if (!ph) return res.status(200).json({s:'no_phone'});
-  console.log('['+ts+'] ['+ec.label+'] CW->WA: '+ph);
+  if (m.message_type !== 'outgoing' || !m.content || m.content_type === 'activity' || m.private) return res.status(200).json({ s: 'skip' });
+  var iid = m.conversation && m.conversation.inbox_id;
+  var eInst = null, eCfg = null;
+  for (var i in INSTANCE_MAP) { if (INSTANCE_MAP[i].inbox_id === iid) { eInst = i; eCfg = INSTANCE_MAP[i]; break; } }
+  if (!eInst) return res.status(200).json({ s: 'no_map' });
+  var meta = (m.conversation && m.conversation.meta && m.conversation.meta.sender) || {};
+  var ph = (meta.phone_number || '').replace(/[^0-9]/g, '');
+  if (!ph) ph = (meta.identifier || '').replace('whatsapp:', '').replace(/[^0-9]/g, '');
+  if (!ph && m.sender) ph = (m.sender.phone_number || '').replace(/[^0-9]/g, '');
+  if (!ph) return res.status(200).json({ s: 'no_ph' });
+  console.log('[' + ts + '] [' + eCfg.label + '] CW->WA: ' + ph);
   try {
-    await axios.post(EVOLUTION_URL+'/message/sendText/'+ei, { number: ph, text: m.content }, { headers: { 'apikey': EVOLUTION_APIKEY, 'Content-Type': 'application/json' }, timeout: 15000 });
-    console.log('['+ts+'] Sent to WA '+ph);
-  } catch(err) { console.error('WA err: '+(err.response ? JSON.stringify(err.response.data) : err.message)); }
-  res.status(200).json({s:'ok'});
+    await axios.post(EVOLUTION_URL + '/message/sendText/' + eInst, { number: ph, text: m.content }, { headers: { 'apikey': EVOLUTION_APIKEY, 'Content-Type': 'application/json' }, timeout: 15000 });
+    console.log('[' + ts + '] Sent to WA ' + ph);
+  } catch(err) { console.error('WA err: ' + (err.response ? JSON.stringify(err.response.data) : err.message)); }
+  res.status(200).json({ s: 'ok' });
 });
 
-app.get('/health', (req, res) => { res.json({ status: 'running', ts: new Date().toISOString() }); });
+app.get('/health', (req, res) => { res.json({ status: 'running', v: 3 }); });
 var PORT = process.env.PORT || 3100;
-app.listen(PORT, () => { console.log('Bridge v3 porta '+PORT); for (var n in INSTANCE_MAP) console.log('  '+INSTANCE_MAP[n].label+' | '+n+' -> inbox '+INSTANCE_MAP[n].inbox_id); });
+app.listen(PORT, () => { console.log('Bridge v3 porta ' + PORT); for (var n in INSTANCE_MAP) console.log('  ' + INSTANCE_MAP[n].label + ' -> inbox ' + INSTANCE_MAP[n].inbox_id); });
