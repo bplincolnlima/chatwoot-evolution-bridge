@@ -3,10 +3,18 @@ const axios = require('axios');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static');
+const FormData = require('form-data');
 
-ffmpeg.setFfmpegPath(ffmpegPath);
+let ffmpeg, ffmpegPath;
+try {
+  ffmpeg = require('fluent-ffmpeg');
+  ffmpegPath = require('ffmpeg-static');
+  ffmpeg.setFfmpegPath(ffmpegPath);
+  console.log('ffmpeg loaded OK');
+} catch (e) {
+  console.log('ffmpeg not available, audio sent as-is');
+  ffmpeg = null;
+}
 
 const app = express();
 app.use(express.json({ limit: '25mb' }));
@@ -24,379 +32,152 @@ const INSTANCE_MAP = {
   'casadafe-c04': { inbox_id: 3, inbox_identifier: 'nvbGe4V3rwGYfJAcvU1F18hT', phone: '67981021304', label: 'C04' },
   'casadafe-c05': { inbox_id: 4, inbox_identifier: 'XDHFCXxCGKMhEkB9RkjLDZth', phone: '67981259143', label: 'C05' }
 };
-
 var cache = {};
 var sentFromChatwoot = {};
-
-var cwApi = axios.create({
-  baseURL: CHATWOOT_URL + '/api/v1/accounts/' + ACCOUNT_ID,
-  headers: {
-    'api_access_token': CHATWOOT_API_TOKEN,
-    'Content-Type': 'application/json'
-  },
-  timeout: 20000
-});
+var cwApi = axios.create({ baseURL: CHATWOOT_URL + '/api/v1/accounts/' + ACCOUNT_ID, headers: { 'api_access_token': CHATWOOT_API_TOKEN, 'Content-Type': 'application/json' }, timeout: 20000 });
 
 async function getOrCreateContact(num, name, inboxId) {
   var k = inboxId + ':' + num;
   if (cache[k] && cache[k].contact_id) return cache[k].contact_id;
-
-  try {
-    var s = await cwApi.get('/contacts/search?q=' + encodeURIComponent(num));
-    var c = s.data.payload || [];
-    if (c.length > 0) {
-      cache[k] = cache[k] || {};
-      cache[k].contact_id = c[0].id;
-      return c[0].id;
-    }
-  } catch (e) {}
-
-  var r = await cwApi.post('/contacts', {
-    name: name,
-    phone_number: '+' + num,
-    identifier: 'whatsapp:' + num
-  });
-
-  var id = r.data.payload.contact.id;
-  cache[k] = cache[k] || {};
-  cache[k].contact_id = id;
-  return id;
+  try { var s = await cwApi.get('/contacts/search?q=' + encodeURIComponent(num)); var c = s.data.payload || []; if (c.length > 0) { cache[k] = cache[k] || {}; cache[k].contact_id = c[0].id; return c[0].id; } } catch (e) {}
+  var r = await cwApi.post('/contacts', { name: name, phone_number: '+' + num, identifier: 'whatsapp:' + num });
+  var id = r.data.payload.contact.id; cache[k] = cache[k] || {}; cache[k].contact_id = id; return id;
 }
 
 async function getOrCreateConv(contactId, inboxId, num) {
   var k = inboxId + ':' + num;
-
-  if (cache[k] && cache[k].conv_id) {
-    try {
-      var cv = await cwApi.get('/conversations/' + cache[k].conv_id);
-      if (cv.data.status === 'open' || cv.data.status === 'pending') return cache[k].conv_id;
-    } catch (e) {}
-  }
-
-  try {
-    var cs = await cwApi.get('/contacts/' + contactId + '/conversations');
-    var convs = cs.data.payload || [];
-    for (var i = 0; i < convs.length; i++) {
-      if (convs[i].inbox_id === inboxId && (convs[i].status === 'open' || convs[i].status === 'pending')) {
-        cache[k] = cache[k] || {};
-        cache[k].conv_id = convs[i].id;
-        return convs[i].id;
-      }
-    }
-  } catch (e) {}
-
-  var r = await cwApi.post('/conversations', {
-    contact_id: contactId,
-    inbox_id: inboxId,
-    status: 'open'
-  });
-
-  cache[k] = cache[k] || {};
-  cache[k].conv_id = r.data.id;
-  return r.data.id;
+  if (cache[k] && cache[k].conv_id) { try { var cv = await cwApi.get('/conversations/' + cache[k].conv_id); if (cv.data.status === 'open' || cv.data.status === 'pending') return cache[k].conv_id; } catch (e) {} }
+  try { var cs = await cwApi.get('/contacts/' + contactId + '/conversations'); var convs = cs.data.payload || []; for (var i = 0; i < convs.length; i++) { if (convs[i].inbox_id === inboxId && (convs[i].status === 'open' || convs[i].status === 'pending')) { cache[k] = cache[k] || {}; cache[k].conv_id = convs[i].id; return convs[i].id; } } } catch (e) {}
+  var r = await cwApi.post('/conversations', { contact_id: contactId, inbox_id: inboxId, status: 'open' }); cache[k] = cache[k] || {}; cache[k].conv_id = r.data.id; return r.data.id;
 }
 
 function extractContent(msg) {
   if (!msg) return '[Msg]';
   if (msg.conversation) return msg.conversation;
   if (msg.extendedTextMessage && msg.extendedTextMessage.text) return msg.extendedTextMessage.text;
-  if (msg.imageMessage) return msg.imageMessage.caption ? '[Imagem] ' + msg.imageMessage.caption : '[Imagem]';
-  if (msg.videoMessage) return msg.videoMessage.caption ? '[Video] ' + msg.videoMessage.caption : '[Video]';
-  if (msg.audioMessage) return '[Audio]';
+  if (msg.imageMessage) return msg.imageMessage.caption || '';
+  if (msg.videoMessage) return msg.videoMessage.caption || '';
+  if (msg.audioMessage) return '';
   if (msg.documentMessage) return msg.documentMessage.fileName ? '[Doc] ' + msg.documentMessage.fileName : '[Doc]';
   if (msg.stickerMessage) return '[Sticker]';
   if (msg.protocolMessage) return null;
   return '[Msg]';
 }
 
-function getMediaInfo(msg) {
+function getMediaType(msg) {
   if (!msg) return null;
-
-  if (msg.audioMessage) {
-    return {
-      url: msg.audioMessage.url,
-      mimetype: msg.audioMessage.mimetype || 'audio/ogg',
-      filename: 'audio.ogg',
-      type: 'audio',
-      convertToMp3: true
-    };
-  }
-
-  if (msg.imageMessage) {
-    return {
-      url: msg.imageMessage.url,
-      mimetype: msg.imageMessage.mimetype || 'image/jpeg',
-      filename: 'imagem.jpg',
-      type: 'image',
-      convertToMp3: false
-    };
-  }
-
-  if (msg.videoMessage) {
-    return {
-      url: msg.videoMessage.url,
-      mimetype: msg.videoMessage.mimetype || 'video/mp4',
-      filename: 'video.mp4',
-      type: 'video',
-      convertToMp3: false
-    };
-  }
-
-  if (msg.documentMessage) {
-    return {
-      url: msg.documentMessage.url,
-      mimetype: msg.documentMessage.mimetype || 'application/octet-stream',
-      filename: msg.documentMessage.fileName || 'documento',
-      type: 'document',
-      convertToMp3: false
-    };
-  }
-
+  if (msg.audioMessage) return { type: 'audio', mimetype: msg.audioMessage.mimetype || 'audio/ogg; codecs=opus', ext: '.ogg' };
+  if (msg.imageMessage) return { type: 'image', mimetype: msg.imageMessage.mimetype || 'image/jpeg', ext: '.jpg' };
+  if (msg.videoMessage) return { type: 'video', mimetype: msg.videoMessage.mimetype || 'video/mp4', ext: '.mp4' };
+  if (msg.documentMessage) return { type: 'document', mimetype: msg.documentMessage.mimetype || 'application/octet-stream', ext: path.extname(msg.documentMessage.fileName || '.bin') };
+  if (msg.stickerMessage) return { type: 'sticker', mimetype: 'image/webp', ext: '.webp' };
   return null;
 }
 
-async function downloadMediaBuffer(url) {
-  var r = await axios.get(url, {
-    responseType: 'arraybuffer',
-    headers: { apikey: EVOLUTION_APIKEY },
-    timeout: 30000
-  });
-  return Buffer.from(r.data);
-}
-
-function writeTempFile(buffer, ext) {
-  var filePath = path.join(
-    os.tmpdir(),
-    'cw-bridge-' + Date.now() + '-' + Math.random().toString(36).slice(2) + ext
-  );
-  fs.writeFileSync(filePath, buffer);
-  return filePath;
-}
-
-function removeFileSafe(filePath) {
+async function downloadMediaFromEvolution(instanceName, messageKey, msgObj) {
   try {
-    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  } catch (e) {}
+    var resp = await axios.post(EVOLUTION_URL + '/chat/getBase64FromMediaMessage/' + instanceName, { message: { key: messageKey, message: msgObj } }, { headers: { apikey: EVOLUTION_APIKEY, 'Content-Type': 'application/json' }, timeout: 30000 });
+    if (resp.data && resp.data.base64) return Buffer.from(resp.data.base64, 'base64');
+  } catch (e) { console.error('getBase64 err: ' + (e.response ? e.response.status : e.message)); }
+  return null;
 }
+
+function writeTempFile(buffer, ext) { var f = path.join(os.tmpdir(), 'cw-' + Date.now() + '-' + Math.random().toString(36).slice(2) + ext); fs.writeFileSync(f, buffer); return f; }
+function removeFile(p) { try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch (e) {} }
 
 function convertOggToMp3(inputPath) {
-  return new Promise(function(resolve, reject) {
-    var outputPath = inputPath.replace(/\.ogg$/i, '.mp3');
-
-    ffmpeg(inputPath)
-      .audioCodec('libmp3lame')
-      .audioBitrate('128k')
-      .format('mp3')
-      .on('end', function() {
-        resolve(outputPath);
-      })
-      .on('error', function(err) {
-        reject(err);
-      })
-      .save(outputPath);
+  return new Promise(function (resolve, reject) {
+    if (!ffmpeg) return reject(new Error('ffmpeg not available'));
+    var out = inputPath.replace(/\.[^.]+$/, '.mp3');
+    ffmpeg(inputPath).audioCodec('libmp3lame').audioBitrate('64k').audioChannels(1).audioFrequency(22050).format('mp3').on('end', function () { resolve(out); }).on('error', function (err) { reject(err); }).save(out);
   });
 }
 
-async function prepareAttachment(mediaInfo) {
-  var originalBuffer = await downloadMediaBuffer(mediaInfo.url);
-
-  if (mediaInfo.type === 'audio' && mediaInfo.convertToMp3) {
-    var inputPath = null;
-    var outputPath = null;
-
-    try {
-      inputPath = writeTempFile(originalBuffer, '.ogg');
-      outputPath = await convertOggToMp3(inputPath);
-      var mp3Buffer = fs.readFileSync(outputPath);
-
-      return {
-        buffer: mp3Buffer,
-        filename: 'audio.mp3',
-        mimetype: 'audio/mpeg'
-      };
-    } finally {
-      removeFileSafe(inputPath);
-      removeFileSafe(outputPath);
-    }
+async function prepareMediaBuffer(mediaType, mediaBuffer) {
+  if (mediaType.type === 'audio' && ffmpeg) {
+    var inp = null, outp = null;
+    try { inp = writeTempFile(mediaBuffer, '.ogg'); outp = await convertOggToMp3(inp); var mp3 = fs.readFileSync(outp); return { buffer: mp3, filename: 'audio.mp3', mimetype: 'audio/mpeg' }; }
+    catch (e) { console.log('ffmpeg fail, sending ogg: ' + e.message); }
+    finally { removeFile(inp); removeFile(outp); }
   }
-
-  return {
-    buffer: originalBuffer,
-    filename: mediaInfo.filename,
-    mimetype: mediaInfo.mimetype
-  };
+  return { buffer: mediaBuffer, filename: mediaType.type + Date.now() + mediaType.ext, mimetype: mediaType.mimetype };
 }
 
-async function sendMessageToChatwoot(convId, content, messageType, mediaInfo) {
-  if (!mediaInfo || !mediaInfo.url) {
-    await cwApi.post('/conversations/' + convId + '/messages', {
-      content: content,
-      message_type: messageType,
-      private: false
-    });
-    return;
-  }
-
-  var attachment = await prepareAttachment(mediaInfo);
-
+async function sendToChatwoot(convId, content, messageType, mediaAttachment) {
+  if (!mediaAttachment) { await cwApi.post('/conversations/' + convId + '/messages', { content: content || '[Msg]', message_type: messageType, private: false }); return; }
   var form = new FormData();
   form.append('content', content || '');
   form.append('message_type', messageType);
   form.append('private', 'false');
-  form.append(
-    'attachments[]',
-    new Blob([attachment.buffer], { type: attachment.mimetype }),
-    attachment.filename
-  );
-
-  var resp = await fetch(
-    CHATWOOT_URL + '/api/v1/accounts/' + ACCOUNT_ID + '/conversations/' + convId + '/messages',
-    {
-      method: 'POST',
-      headers: {
-        api_access_token: CHATWOOT_API_TOKEN
-      },
-      body: form
-    }
-  );
-
-  if (!resp.ok) {
-    var txt = await resp.text();
-    throw new Error('Chatwoot attachment upload failed: ' + txt);
-  }
+  form.append('attachments[]', mediaAttachment.buffer, { filename: mediaAttachment.filename, contentType: mediaAttachment.mimetype });
+  await axios.post(CHATWOOT_URL + '/api/v1/accounts/' + ACCOUNT_ID + '/conversations/' + convId + '/messages', form, { headers: { ...form.getHeaders(), 'api_access_token': CHATWOOT_API_TOKEN }, timeout: 60000, maxContentLength: 50*1024*1024, maxBodyLength: 50*1024*1024 });
 }
 
 app.post('/webhook/:instance', async (req, res) => {
-  var inst = req.params.instance;
-  var cfg = INSTANCE_MAP[inst];
-  var ts = new Date().toISOString();
-
+  var inst = req.params.instance, cfg = INSTANCE_MAP[inst], ts = new Date().toISOString();
   if (!cfg) return res.status(200).json({ s: 'unknown' });
-
-  var body = req.body;
-  var ev = body.event;
-  if (!ev || (ev !== 'messages.upsert' && ev !== 'MESSAGES_UPSERT')) {
-    return res.status(200).json({ s: 'skip' });
-  }
-
-  var data = body.data || body;
-  var key = data.key;
-  var msg = data.message;
-
+  var body = req.body, ev = body.event;
+  if (!ev || (ev !== 'messages.upsert' && ev !== 'MESSAGES_UPSERT')) return res.status(200).json({ s: 'skip' });
+  var data = body.data || body, key = data.key, msg = data.message;
   if (!key) return res.status(200).json({ s: 'skip' });
-
   var jid = key.remoteJid || '';
-  if (jid.endsWith('@g.us') || jid === 'status@broadcast') {
-    return res.status(200).json({ s: 'skip' });
-  }
-
+  if (jid.endsWith('@g.us') || jid === 'status@broadcast') return res.status(200).json({ s: 'skip' });
   var num = jid.replace('@s.whatsapp.net', '');
   var content = extractContent(msg);
-  var mediaInfo = getMediaInfo(msg);
-
   if (content === null) return res.status(200).json({ s: 'protocol' });
-
-  if (key.fromMe) {
-    var cacheKey = cfg.label + ':' + num + ':' + content.substring(0, 50);
-    if (sentFromChatwoot[cacheKey]) {
-      console.log('[' + ts + '] [' + cfg.label + '] Anti-loop: msg do Chatwoot, ignorando');
-      delete sentFromChatwoot[cacheKey];
-      return res.status(200).json({ s: 'anti_loop' });
-    }
-
-    console.log('[' + ts + '] [' + cfg.label + '] ZAPPED->CW (' + num + '): ' + content.substring(0, 80));
+  var mediaType = getMediaType(msg);
+  var mediaAttachment = null;
+  if (mediaType) {
     try {
-      var outName = data.pushName || num;
-      var outCid = await getOrCreateContact(num, outName, cfg.inbox_id);
-      var outConvId = await getOrCreateConv(outCid, cfg.inbox_id, num);
-      await sendMessageToChatwoot(outConvId, content, 'outgoing', mediaInfo);
-      console.log('[' + ts + '] [' + cfg.label + '] OUTGOING registrada conv=' + outConvId + (mediaInfo ? ' media=' + mediaInfo.type : ''));
-    } catch (err) {
-      console.error('[' + ts + '] [' + cfg.label + '] ERR outgoing: ' + (err.response ? JSON.stringify(err.response.data) : err.message));
-    }
-
-    return res.status(200).json({ s: 'outgoing_registered' });
+      var mediaBuffer = await downloadMediaFromEvolution(inst, key, msg);
+      if (mediaBuffer) { mediaAttachment = await prepareMediaBuffer(mediaType, mediaBuffer); console.log('[' + ts + '] [' + cfg.label + '] media ' + mediaType.type + ' ' + mediaAttachment.buffer.length + 'b -> ' + mediaAttachment.filename); }
+      else { console.log('[' + ts + '] [' + cfg.label + '] media download failed'); if (!content) content = '[' + mediaType.type.charAt(0).toUpperCase() + mediaType.type.slice(1) + ']'; }
+    } catch (e) { console.error('[' + ts + '] [' + cfg.label + '] media err: ' + e.message); if (!content) content = '[' + mediaType.type.charAt(0).toUpperCase() + mediaType.type.slice(1) + ']'; }
   }
-
+  if (!content && !mediaAttachment) content = '[Msg]';
+  if (key.fromMe) {
+    var ck = cfg.label + ':' + num + ':' + (content || '').substring(0, 50);
+    if (sentFromChatwoot[ck]) { delete sentFromChatwoot[ck]; return res.status(200).json({ s: 'anti_loop' }); }
+    console.log('[' + ts + '] [' + cfg.label + '] ZAPPED->CW (' + num + '): ' + (content || '[media]').substring(0, 80));
+    try { var on = data.pushName || num; var oc = await getOrCreateContact(num, on, cfg.inbox_id); var ov = await getOrCreateConv(oc, cfg.inbox_id, num); await sendToChatwoot(ov, content, 'outgoing', mediaAttachment); console.log('[' + ts + '] [' + cfg.label + '] OUT conv=' + ov + (mediaAttachment ? ' +media' : '')); }
+    catch (err) { console.error('[' + ts + '] [' + cfg.label + '] ERR out: ' + (err.response ? JSON.stringify(err.response.data).substring(0, 200) : err.message)); }
+    return res.status(200).json({ s: 'ok' });
+  }
   var name = data.pushName || num;
-  console.log('[' + ts + '] [' + cfg.label + '] ' + name + ' (' + num + '): ' + content);
-
-  try {
-    var cid = await getOrCreateContact(num, name, cfg.inbox_id);
-    var convId = await getOrCreateConv(cid, cfg.inbox_id, num);
-    await sendMessageToChatwoot(convId, content, 'incoming', mediaInfo);
-    console.log('[' + ts + '] [' + cfg.label + '] INCOMING conv=' + convId + (mediaInfo ? ' media=' + mediaInfo.type : ''));
-  } catch (err) {
-    console.error('[' + ts + '] [' + cfg.label + '] ERR: ' + (err.response ? JSON.stringify(err.response.data) : err.message));
-  }
-
+  console.log('[' + ts + '] [' + cfg.label + '] ' + name + ' (' + num + '): ' + (content || '[media]').substring(0, 80));
+  try { var cid = await getOrCreateContact(num, name, cfg.inbox_id); var convId = await getOrCreateConv(cid, cfg.inbox_id, num); await sendToChatwoot(convId, content, 'incoming', mediaAttachment); console.log('[' + ts + '] [' + cfg.label + '] IN conv=' + convId + (mediaAttachment ? ' +media' : '')); }
+  catch (err) { console.error('[' + ts + '] [' + cfg.label + '] ERR: ' + (err.response ? JSON.stringify(err.response.data).substring(0, 200) : err.message)); }
   res.status(200).json({ s: 'ok' });
 });
 
 app.post('/chatwoot-webhook', async (req, res) => {
   var ts = new Date().toISOString();
-
   if (req.body.event !== 'message_created') return res.status(200).json({ s: 'skip' });
-
   var m = req.body;
-  if (m.message_type !== 'outgoing' || !m.content || m.content_type === 'activity' || m.private) {
-    return res.status(200).json({ s: 'skip' });
-  }
-
+  if (m.message_type !== 'outgoing' || !m.content || m.content_type === 'activity' || m.private) return res.status(200).json({ s: 'skip' });
   var iid = m.conversation && m.conversation.inbox_id;
-  var eInst = null;
-  var eCfg = null;
-
-  for (var i in INSTANCE_MAP) {
-    if (INSTANCE_MAP[i].inbox_id === iid) {
-      eInst = i;
-      eCfg = INSTANCE_MAP[i];
-      break;
-    }
-  }
-
+  var eInst = null, eCfg = null;
+  for (var i in INSTANCE_MAP) { if (INSTANCE_MAP[i].inbox_id === iid) { eInst = i; eCfg = INSTANCE_MAP[i]; break; } }
   if (!eInst) return res.status(200).json({ s: 'no_map' });
-
   var meta = (m.conversation && m.conversation.meta && m.conversation.meta.sender) || {};
   var ph = (meta.phone_number || '').replace(/[^0-9]/g, '');
   if (!ph) ph = (meta.identifier || '').replace('whatsapp:', '').replace(/[^0-9]/g, '');
   if (!ph && m.sender) ph = (m.sender.phone_number || '').replace(/[^0-9]/g, '');
   if (!ph) return res.status(200).json({ s: 'no_ph' });
-
-  var cacheKey = eCfg.label + ':' + ph + ':' + m.content.substring(0, 50);
-  sentFromChatwoot[cacheKey] = true;
-  setTimeout(function() { delete sentFromChatwoot[cacheKey]; }, 60000);
-
+  var ck = eCfg.label + ':' + ph + ':' + m.content.substring(0, 50);
+  sentFromChatwoot[ck] = true;
+  setTimeout(function () { delete sentFromChatwoot[ck]; }, 60000);
   console.log('[' + ts + '] [' + eCfg.label + '] CW->WA: ' + ph);
-
-  try {
-    await axios.post(
-      EVOLUTION_URL + '/message/sendText/' + eInst,
-      { number: ph, text: m.content },
-      {
-        headers: {
-          apikey: EVOLUTION_APIKEY,
-          'Content-Type': 'application/json'
-        },
-        timeout: 15000
-      }
-    );
-    console.log('[' + ts + '] Sent to WA ' + ph);
-  } catch (err) {
-    console.error('WA err: ' + (err.response ? JSON.stringify(err.response.data) : err.message));
-  }
-
+  try { await axios.post(EVOLUTION_URL + '/message/sendText/' + eInst, { number: ph, text: m.content }, { headers: { apikey: EVOLUTION_APIKEY, 'Content-Type': 'application/json' }, timeout: 15000 }); console.log('[' + ts + '] Sent to WA ' + ph); }
+  catch (err) { console.error('WA err: ' + (err.response ? JSON.stringify(err.response.data) : err.message)); }
   res.status(200).json({ s: 'ok' });
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'running', v: 7, instances: Object.keys(INSTANCE_MAP) });
-});
+app.get('/health', (req, res) => { res.json({ status: 'running', v: 9, ffmpeg: !!ffmpeg, instances: Object.keys(INSTANCE_MAP) }); });
 
 var PORT = process.env.PORT || 3100;
 app.listen(PORT, () => {
-  console.log('Bridge v8 porta ' + PORT);
-  for (var n in INSTANCE_MAP) {
-    console.log('  ' + INSTANCE_MAP[n].label + ' -> inbox ' + INSTANCE_MAP[n].inbox_id);
-  }
+  console.log('Bridge v9 porta ' + PORT + ' | ffmpeg=' + !!ffmpeg);
+  for (var n in INSTANCE_MAP) console.log('  ' + INSTANCE_MAP[n].label + ' -> inbox ' + INSTANCE_MAP[n].inbox_id);
 });
+
