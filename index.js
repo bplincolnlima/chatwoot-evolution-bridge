@@ -1,5 +1,12 @@
 const express = require('express');
 const axios = require('axios');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
+
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
 app.use(express.json({ limit: '25mb' }));
@@ -110,7 +117,8 @@ function getMediaInfo(msg) {
       url: msg.audioMessage.url,
       mimetype: msg.audioMessage.mimetype || 'audio/ogg',
       filename: 'audio.ogg',
-      type: 'audio'
+      type: 'audio',
+      convertToMp3: true
     };
   }
 
@@ -119,7 +127,8 @@ function getMediaInfo(msg) {
       url: msg.imageMessage.url,
       mimetype: msg.imageMessage.mimetype || 'image/jpeg',
       filename: 'imagem.jpg',
-      type: 'image'
+      type: 'image',
+      convertToMp3: false
     };
   }
 
@@ -128,7 +137,8 @@ function getMediaInfo(msg) {
       url: msg.videoMessage.url,
       mimetype: msg.videoMessage.mimetype || 'video/mp4',
       filename: 'video.mp4',
-      type: 'video'
+      type: 'video',
+      convertToMp3: false
     };
   }
 
@@ -137,7 +147,8 @@ function getMediaInfo(msg) {
       url: msg.documentMessage.url,
       mimetype: msg.documentMessage.mimetype || 'application/octet-stream',
       filename: msg.documentMessage.fileName || 'documento',
-      type: 'document'
+      type: 'document',
+      convertToMp3: false
     };
   }
 
@@ -153,6 +164,69 @@ async function downloadMediaBuffer(url) {
   return Buffer.from(r.data);
 }
 
+function writeTempFile(buffer, ext) {
+  var filePath = path.join(
+    os.tmpdir(),
+    'cw-bridge-' + Date.now() + '-' + Math.random().toString(36).slice(2) + ext
+  );
+  fs.writeFileSync(filePath, buffer);
+  return filePath;
+}
+
+function removeFileSafe(filePath) {
+  try {
+    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch (e) {}
+}
+
+function convertOggToMp3(inputPath) {
+  return new Promise(function(resolve, reject) {
+    var outputPath = inputPath.replace(/\.ogg$/i, '.mp3');
+
+    ffmpeg(inputPath)
+      .audioCodec('libmp3lame')
+      .audioBitrate('128k')
+      .format('mp3')
+      .on('end', function() {
+        resolve(outputPath);
+      })
+      .on('error', function(err) {
+        reject(err);
+      })
+      .save(outputPath);
+  });
+}
+
+async function prepareAttachment(mediaInfo) {
+  var originalBuffer = await downloadMediaBuffer(mediaInfo.url);
+
+  if (mediaInfo.type === 'audio' && mediaInfo.convertToMp3) {
+    var inputPath = null;
+    var outputPath = null;
+
+    try {
+      inputPath = writeTempFile(originalBuffer, '.ogg');
+      outputPath = await convertOggToMp3(inputPath);
+      var mp3Buffer = fs.readFileSync(outputPath);
+
+      return {
+        buffer: mp3Buffer,
+        filename: 'audio.mp3',
+        mimetype: 'audio/mpeg'
+      };
+    } finally {
+      removeFileSafe(inputPath);
+      removeFileSafe(outputPath);
+    }
+  }
+
+  return {
+    buffer: originalBuffer,
+    filename: mediaInfo.filename,
+    mimetype: mediaInfo.mimetype
+  };
+}
+
 async function sendMessageToChatwoot(convId, content, messageType, mediaInfo) {
   if (!mediaInfo || !mediaInfo.url) {
     await cwApi.post('/conversations/' + convId + '/messages', {
@@ -163,7 +237,7 @@ async function sendMessageToChatwoot(convId, content, messageType, mediaInfo) {
     return;
   }
 
-  var mediaBuffer = await downloadMediaBuffer(mediaInfo.url);
+  var attachment = await prepareAttachment(mediaInfo);
 
   var form = new FormData();
   form.append('content', content || '');
@@ -171,8 +245,8 @@ async function sendMessageToChatwoot(convId, content, messageType, mediaInfo) {
   form.append('private', 'false');
   form.append(
     'attachments[]',
-    new Blob([mediaBuffer], { type: mediaInfo.mimetype }),
-    mediaInfo.filename
+    new Blob([attachment.buffer], { type: attachment.mimetype }),
+    attachment.filename
   );
 
   var resp = await fetch(
@@ -236,7 +310,7 @@ app.post('/webhook/:instance', async (req, res) => {
       var outCid = await getOrCreateContact(num, outName, cfg.inbox_id);
       var outConvId = await getOrCreateConv(outCid, cfg.inbox_id, num);
       await sendMessageToChatwoot(outConvId, content, 'outgoing', mediaInfo);
-      console.log('[' + ts + '] [' + cfg.label + '] OUTGOING registrada conv=' + outConvId);
+      console.log('[' + ts + '] [' + cfg.label + '] OUTGOING registrada conv=' + outConvId + (mediaInfo ? ' media=' + mediaInfo.type : ''));
     } catch (err) {
       console.error('[' + ts + '] [' + cfg.label + '] ERR outgoing: ' + (err.response ? JSON.stringify(err.response.data) : err.message));
     }
@@ -291,7 +365,7 @@ app.post('/chatwoot-webhook', async (req, res) => {
 
   var cacheKey = eCfg.label + ':' + ph + ':' + m.content.substring(0, 50);
   sentFromChatwoot[cacheKey] = true;
-  setTimeout(function () { delete sentFromChatwoot[cacheKey]; }, 60000);
+  setTimeout(function() { delete sentFromChatwoot[cacheKey]; }, 60000);
 
   console.log('[' + ts + '] [' + eCfg.label + '] CW->WA: ' + ph);
 
@@ -316,12 +390,12 @@ app.post('/chatwoot-webhook', async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'running', v: 6, instances: Object.keys(INSTANCE_MAP) });
+  res.json({ status: 'running', v: 7, instances: Object.keys(INSTANCE_MAP) });
 });
 
 var PORT = process.env.PORT || 3100;
 app.listen(PORT, () => {
-  console.log('Bridge v6 porta ' + PORT);
+  console.log('Bridge v7 porta ' + PORT);
   for (var n in INSTANCE_MAP) {
     console.log('  ' + INSTANCE_MAP[n].label + ' -> inbox ' + INSTANCE_MAP[n].inbox_id);
   }
