@@ -395,7 +395,7 @@ app.get('/health', (req, res) => {
 
 var PORT = process.env.PORT || 3100;
 app.listen(PORT, () => {
-  console.log('Bridge v7 porta ' + PORT);
+  console.log('Bridge v8 porta ' + PORT);
   for (var n in INSTANCE_MAP) {
     console.log('  ' + INSTANCE_MAP[n].label + ' -> inbox ' + INSTANCE_MAP[n].inbox_id);
   }
